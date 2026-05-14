@@ -1,0 +1,18 @@
+# secrets
+.env
+state.json
+
+# generated outputs
+summaries/
+images/
+thermal/
+qrcodes/
+usb_pdfs/
+__pycache__/
+*.pyc
+
+# large files
+*.pdf
+*.jpg
+*.png
+*.djvu
