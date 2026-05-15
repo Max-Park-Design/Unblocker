@@ -16,3 +16,4 @@ __pycache__/
 *.jpg
 *.png
 *.djvu
+bin/

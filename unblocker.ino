@@ -154,6 +154,8 @@ void streamMAX30102Raw(int samples) {
   }
 
   Serial.println("HR_DONE");
+  strip.clear();
+  strip.show();
   i2cBusy = false;
 }
 

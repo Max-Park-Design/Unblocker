@@ -79,6 +79,8 @@ USB_PORT_MAP = {
 
 def get_usb_slot(device):
     path = device.get("ID_PATH", "")
+    if not path and device.parent:
+        path = device.parent.get("ID_PATH", "")
     for port, slot in USB_PORT_MAP.items():
         if port in path:
             return slot
@@ -103,6 +105,16 @@ def find_pdf_on_device(device_node, dest_path):
         print(f"  Mount error: {e}")
     return False
 
+def get_usb_slot(device):
+    path = device.get("ID_PATH", "")
+    if not path and device.parent:
+        path = device.parent.get("ID_PATH", "")
+    for port, slot in USB_PORT_MAP.items():
+        if port in path:
+            return slot
+    return None
+
+
 def usb_monitor_thread():
     import pyudev
     script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -111,7 +123,7 @@ def usb_monitor_thread():
 
     context = pyudev.Context()
     monitor = pyudev.Monitor.from_netlink(context)
-    monitor.filter_by(subsystem="block", device_type="partition")
+    monitor.filter_by(subsystem="block")
 
     print("USB monitor started...")
 
@@ -127,7 +139,6 @@ def usb_monitor_thread():
                     text = extract_pdf_text(p)
                     if not text:
                         return
-                    # wait for notebook_id to be available
                     import time as _t
                     for _ in range(60):
                         if _notebook_id:
@@ -141,7 +152,9 @@ def usb_monitor_thread():
                     sid = result.get("id") or result.get("source_id")
                     if sid:
                         _usb_source_cache[s] = sid
-                        print(f"  {s} embedded: {sid}")
+                        print(f"  {s} embedded: {sid}, waiting for processing...")
+                        wait_for_source_processing(sid)
+                        print(f"  {s} ready!")
                     else:
                         print(f"  {s}: embedding failed")
                 threading.Thread(target=embed_async, daemon=True).start()
@@ -150,11 +163,13 @@ def usb_monitor_thread():
 
     for device in iter(monitor.poll, None):
         action = device.action
+        if device.device_type not in ("partition", "disk"):
+            continue
         slot = get_usb_slot(device)
         if not slot:
             continue
 
-        if action == "add":
+        if action == "add" and device.device_type == "partition":
             print(f"  USB inserted in {slot}")
             import time as _time
             _time.sleep(1)
@@ -165,7 +180,6 @@ def usb_monitor_thread():
                     text = extract_pdf_text(p)
                     if not text:
                         return
-                    # wait for notebook_id to be available
                     import time as _t
                     for _ in range(60):
                         if _notebook_id:
@@ -179,7 +193,9 @@ def usb_monitor_thread():
                     sid = result.get("id") or result.get("source_id")
                     if sid:
                         _usb_source_cache[s] = sid
-                        print(f"  {s} embedded: {sid}")
+                        print(f"  {s} embedded: {sid}, waiting for processing...")
+                        wait_for_source_processing(sid)
+                        print(f"  {s} ready!")
                     else:
                         print(f"  {s}: embedding failed")
                 threading.Thread(target=embed_async, daemon=True).start()
@@ -187,10 +203,14 @@ def usb_monitor_thread():
                 print(f"  No PDF found on {slot}")
 
         elif action == "remove":
-            source_id = _usb_source_cache.pop(slot, None)
-            if source_id:
+            if slot in _usb_source_cache:
+                source_id = _usb_source_cache.pop(slot)
                 delete_source(source_id)
                 print(f"  {slot} removed from Open Notebook")
+            dest = os.path.join(usb_dir, f"{slot}.pdf")
+            if os.path.exists(dest):
+                os.remove(dest)
+                print(f"  {slot} PDF deleted")
 
 def send_led(cmd):
     _serial.write(f"LED:{cmd}\n".encode())
@@ -301,9 +321,12 @@ def read_emotional_state(timeout=10):
         time.sleep(0.1)
 
     # drain effect
+    send_led("OFF")
+    time.sleep(0.1)
     for i in range(15, -1, -1):
         send_led(f"RED:{i}" if i > 0 else "OFF")
         time.sleep(0.05)
+    send_led("OFF")
 
     _hr_reading = False
 
@@ -1115,7 +1138,7 @@ def get_sources_in_notebook(notebook_id: str) -> list:
     return data if isinstance(data, list) else []
 
 def delete_source(source_id: str) -> tuple[bool, str]:
-    response = requests.delete(f"{OPEN_NOTEBOOK_API}/api/sources/{source_id}", timeout=30)
+    response = requests.delete(f"{OPEN_NOTEBOOK_API}/api/sources/{source_id}", timeout=60)
     if 200 <= response.status_code < 300:
         return True, response.text
     return False, response.text
@@ -1123,25 +1146,28 @@ def delete_source(source_id: str) -> tuple[bool, str]:
 def clear_notebook_sources(notebook_id: str) -> dict:
     initial_sources = get_sources_in_notebook(notebook_id)
     print(f"Found {len(initial_sources)} existing source(s). Deleting...")
+    usb_source_ids = set(_usb_source_cache.values())
+    to_delete = [s.get("id") for s in initial_sources if s.get("id") and s.get("id") not in usb_source_ids]
+
     deleted = []
     failed = []
-    usb_source_ids = set(_usb_source_cache.values())
-    for source in initial_sources:
-        source_id = source.get("id")
-        if not source_id:
-            continue
-        if source_id in usb_source_ids:
-            print(f"  Skipping USB source {source_id}")
-            continue
+
+    def do_delete(source_id):
         ok, body = delete_source(source_id)
         if ok:
             deleted.append(source_id)
         else:
             failed.append({"source_id": source_id, "response": body})
-        time.sleep(0.5)
-    time.sleep(1.5)
-    remaining_sources = get_sources_in_notebook(notebook_id)
-    remaining_ids = [s.get("id") for s in remaining_sources if s.get("id")]
+
+    threads = [threading.Thread(target=do_delete, args=(sid,)) for sid in to_delete]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=60)
+
+    time.sleep(1)
+    remaining = get_sources_in_notebook(notebook_id)
+    remaining_ids = [s.get("id") for s in remaining if s.get("id")]
     print(f"Remaining sources after clear: {len(remaining_ids)}")
     return {"initial_count": len(initial_sources), "deleted_ids": deleted, "failed_deletions": failed, "remaining_count": len(remaining_ids), "remaining_ids": remaining_ids}
 
@@ -1162,9 +1188,16 @@ def add_link_source(notebook_id: str, url: str, retries: int = 5, delay: float =
 
 def add_text_source(notebook_id: str, title: str, text: str) -> dict:
     data = {"type": "text", "notebook_id": notebook_id, "title": title, "content": text, "embed": "true", "async_processing": "true"}
-    response = requests.post(f"{OPEN_NOTEBOOK_API}/api/sources", data=data, timeout=120)
-    response.raise_for_status()
-    return response.json()
+    for attempt in range(3):
+        try:
+            response = requests.post(f"{OPEN_NOTEBOOK_API}/api/sources", data=data, timeout=120)
+            response.raise_for_status()
+            return response.json()
+        except Exception as e:
+            if attempt == 2:
+                raise
+            print(f"  add_text_source retry {attempt+1}: {e}")
+            time.sleep(2)
 
 def wait_for_source_processing(source_id: str, timeout: int = 300) -> bool:
     deadline = time.time() + timeout
@@ -1630,6 +1663,14 @@ _usb_thread.start()
 
 time.sleep(2)
 print("Waiting for full rotation to trigger run...")
+
+# pre-fetch notebook ID so USB embedding can start immediately
+try:
+    _notebook = get_latest_notebook()
+    _notebook_id = _notebook["id"]
+    print(f"Notebook ready: {_notebook_id}")
+except Exception as e:
+    print(f"Could not pre-fetch notebook: {e}")
 
 # ---------------- MAIN LOOP ----------------
 
